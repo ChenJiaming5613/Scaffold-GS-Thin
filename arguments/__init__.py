@@ -69,6 +69,10 @@ class ModelParams(ParamGroup):
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
         self.undistorted = False 
+        # thin-structure point supplementation (thin_init/), 0 = original Scaffold-GS initialisation
+        self.thin_init = 1
+        self.thin_init_dir = ""   # default <source>/thin_init
+        self.thin_init_args = ""  # extra args for thin_init/triangulate.py, e.g. "--frames 1-40 --bg colmap"
         
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.

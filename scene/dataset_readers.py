@@ -146,7 +146,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod, llffhold=8, init_ply=None):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -193,6 +193,8 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
+    if init_ply is not None:  # supplemented initial cloud (thin_init)
+        ply_path = init_ply
     # try:
     print(f'start fetching data from ply file')
     pcd = fetchPly(ply_path)
