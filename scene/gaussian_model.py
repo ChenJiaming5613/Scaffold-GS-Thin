@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
@@ -89,6 +90,7 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.use_gr = self.use_gt = False   # GR / GT switches, set in training_setup
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -281,6 +283,14 @@ class GaussianModel:
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
+        # GR / GT lifecycle buffers (follow anchors through growing / pruning)
+        self.lc = training_args
+        self.use_gr = bool(getattr(training_args, "use_gr", False))
+        self.use_gt = bool(getattr(training_args, "use_gt", False))
+        if self.use_gr or self.use_gt:
+            self.anchor_visits = torch.zeros((self.get_anchor.shape[0]), device="cuda")  # n_v, never reset
+            self.anchor_disp = torch.zeros((self.get_anchor.shape[0]), device="cuda")    # D_v (EMA over views)
+            self.birth_scaling = self._scaling.detach().clone()                         # s_v^birth (log)
         
         
         if self.use_feat_bank:
@@ -528,6 +538,53 @@ class GaussianModel:
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
 
+        if self.use_gr and getattr(self, "_last_scale_rot", None) is not None:
+            self._update_dispersion(self._last_scale_rot, opacity.detach(), anchor_visible_mask.view([-1, self.n_offsets])[:, 0])
+            self._last_scale_rot = None
+
+    # ---------------- GR / GT (anchor lifecycle) ----------------
+    def maturity(self):
+        return torch.clamp(self.anchor_visits / max(self.lc.n_conf, 1), max=1.0)   # c_v, Eq.(9)
+
+    def _update_dispersion(self, scale_rot, neural_opacity, vis):
+        """GR Eq.(6)-(8): dispersion of the K decoded Gaussians of each visible anchor (active ones only)."""
+        K = self.n_offsets
+        w = (neural_opacity.view(-1, K) > 0).float()                          # active Gaussians
+        k = w.sum(1)
+        r = torch.sigmoid(scale_rot[:, :3]).view(-1, K, 3)                    # relative scale r_i
+        q = torch.nn.functional.normalize(scale_rot[:, 3:7], dim=-1).view(-1, K, 4)
+        r_bar = (w[..., None] * r).sum(1) / k.clamp(min=1)[:, None]
+        d_r = 4.0 / 3.0 * (w * ((r - r_bar[:, None]) ** 2).sum(-1)).sum(1) / k.clamp(min=1)
+        g = torch.bmm(q, q.transpose(1, 2)).abs() * (w[:, :, None] * w[:, None, :])
+        d_q = (k * k - g.sum((1, 2))) / (k * (k - 1)).clamp(min=1)              # = 2/(K(K-1)) sum_{i<j} (1-|<qi,qj>|)
+        d = self.lc.lambda_r * d_r + self.lc.lambda_q * d_q
+        d = torch.where(k >= 2, d, torch.zeros_like(d))
+        self.anchor_disp[vis] = 0.9 * self.anchor_disp[vis] + 0.1 * d          # smooth over views (MLP is view-dependent)
+
+    def lifecycle_step(self, visible_mask):
+        """Called every iteration: n_v += 1 for visible anchors; returns GT preservation loss Eq.(13)."""
+        self.anchor_visits[visible_mask] += 1
+        if not self.use_gt:
+            return 0.0
+        w = 1.0 - self.maturity()[visible_mask]
+        diff = ((self._scaling[visible_mask, 3:] - self.birth_scaling[visible_mask, 3:]) ** 2).sum(-1)  # base scale, log space
+        return (w * diff).mean() if diff.numel() > 0 else 0.0
+
+    def _gr_offset_mask(self):
+        """GR Eq.(10): mature (c_v = 1) and D_v > tau_disp, expanded to the K offsets of each anchor."""
+        m = (self.maturity() >= 1.0) & (self.anchor_disp > self.lc.tau_disp)
+        return m.unsqueeze(1).repeat([1, self.n_offsets]).view(-1)
+
+    def _lifecycle_cat(self, n_new, birth):
+        self.anchor_visits = torch.cat([self.anchor_visits, torch.zeros(n_new, device="cuda")])
+        self.anchor_disp = torch.cat([self.anchor_disp, torch.zeros(n_new, device="cuda")])
+        self.birth_scaling = torch.cat([self.birth_scaling, birth.detach()])
+
+    def _lifecycle_prune(self, keep):
+        self.anchor_visits = self.anchor_visits[keep]
+        self.anchor_disp = self.anchor_disp[keep]
+        self.birth_scaling = self.birth_scaling[keep]
+
         
 
         
@@ -579,15 +636,18 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, gr_mask=None):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
+        shrunk = torch.zeros(self.get_anchor.shape[0], dtype=torch.bool, device="cuda")  # GT: shrink each parent once
         for i in range(self.update_depth):
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             # mask from grad threshold
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+            if gr_mask is not None:   # GR: dispersion candidates complement the gradient criterion
+                candidate_mask = torch.logical_or(candidate_mask, gr_mask)
             
             # random pick
             rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
@@ -648,6 +708,21 @@ class GaussianModel:
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
+                if self.use_gt:   # GT Eq.(11)-(12): inherit parent base scale (cols 3:), bounded by level size eps_g = cur_size
+                    parent = torch.arange(candidate_mask.shape[0], device="cuda")[candidate_mask] // self.n_offsets
+                    parent = torch.zeros(selected_grid_coords_unique.shape[0], dtype=torch.long, device="cuda").scatter_(0, inverse_indices, parent)[remove_duplicates]
+                    s_p = self._scaling.detach()[parent][:, 3:]                            # log base scale [M, 3]
+                    split = s_p.exp().max(dim=1).values > self.lc.gt_eta * self.spatial_lr_scale
+                    log_k = math.log(self.lc.gt_kappa)
+                    new_scaling[:, 3:] = torch.minimum(s_p - split[:, None].float() * log_k, new_scaling[:, 3:])
+                    sp_idx = parent[split].unique()
+                    sp_idx = sp_idx[~shrunk[sp_idx]]
+                    self._scaling.data[sp_idx, 3:] -= log_k
+                    self.birth_scaling[sp_idx, 3:] -= log_k
+                    shrunk[sp_idx] = True
+
+                if self.use_gr or self.use_gt:
+                    self._lifecycle_cat(candidate_anchor.shape[0], new_scaling)
                 d = {
                     "anchor": candidate_anchor,
                     "scaling": new_scaling,
@@ -685,7 +760,11 @@ class GaussianModel:
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        gr_mask = self._gr_offset_mask() if self.use_gr else None
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask, gr_mask)
+        if gr_mask is not None:   # triggered anchors must re-accumulate dispersion before firing again
+            n0 = gr_mask.shape[0] // self.n_offsets
+            self.anchor_disp[:n0][gr_mask.view(-1, self.n_offsets)[:, 0]] = 0
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -728,6 +807,9 @@ class GaussianModel:
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
+
+        if self.use_gr or self.use_gt:
+            self._lifecycle_prune(~prune_mask)
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)

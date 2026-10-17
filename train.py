@@ -143,6 +143,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        if opt.use_gr or opt.use_gt:   # anchor lifecycle: visibility count n_v (+ GT preservation loss)
+            loss = loss + opt.lambda_pres * gaussians.lifecycle_step(voxel_visible_mask)
 
         loss.backward()
         

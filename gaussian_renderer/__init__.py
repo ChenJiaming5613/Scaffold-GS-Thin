@@ -86,6 +86,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
+    if is_training and getattr(pc, "use_gr", False): pc._last_scale_rot = scale_rot.detach()  # GR dispersion stats
     
     # offsets
     offsets = grid_offsets.view([-1, 3]) # [mask]

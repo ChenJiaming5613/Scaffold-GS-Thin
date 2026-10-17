@@ -156,6 +156,18 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # GR: dispersion-guided geometric refinement (off = original Scaffold-GS)
+        self.use_gr = False
+        self.tau_disp = 0.25
+        self.n_conf = 200        # visibility count for maturity c_v = min(n_v / n_conf, 1), shared by GR and GT
+        self.lambda_r = 0.3
+        self.lambda_q = 0.7
+        # GT: parent-aware geometric transfer (birth-scale inheritance + maturity-aware preservation loss)
+        self.use_gt = False
+        self.gt_eta = 0.01
+        self.gt_kappa = 1.6
+        self.lambda_pres = 0.01
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
